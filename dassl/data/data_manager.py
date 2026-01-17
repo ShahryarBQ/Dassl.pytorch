@@ -2,12 +2,16 @@ import torch
 import torchvision.transforms as T
 from tabulate import tabulate
 from torch.utils.data import Dataset as TorchDataset
+from collections import defaultdict
 
 from dassl.utils import read_image
 
 from .datasets import build_dataset
 from .samplers import build_sampler
 from .transforms import INTERPOLATION_MODES, build_transform
+
+# Author-added
+import numpy as np
 
 
 def build_data_loader(
@@ -47,7 +51,77 @@ def build_data_loader(
 
     return data_loader
 
+# DDG-added
+def build_data_loaders_dfed(
+    cfg,
+    sampler_type="RandomClassSampler",
+    data_source=None,
+    batch_size=64,
+    n_domain=0,
+    n_ins=2,
+    tfm=None,
+    is_train=True,
+    dataset_wrapper=None,
+    num_clients=30
+):
+    # Author-added (Inspired by samplers.py code)
+    domain_dict = defaultdict(list)
+    for i, item in enumerate(data_source):
+        domain_dict[item.domain].append(item)
+    domains = list(domain_dict.keys())
+    domains.sort()
+    print(domains)
 
+    # Make sure each domain has equal number of clients
+    n_client_per_domain = num_clients // len(domains)
+    rem_clients = num_clients - n_client_per_domain * len(domains)
+    n_client_per_domain_dict = {d : n_client_per_domain for d in domains}
+    for d in domains:
+        if rem_clients > 0:
+            n_client_per_domain_dict[d] += 1
+            rem_clients -= 1
+
+    # Make sure each client in a domain has equal number of images
+    n_img_per_client_dict = {d : len(domain_dict[d]) // n_client_per_domain_dict[d] for d in domains}
+    rem_imgs_dict = {d : len(domain_dict[d]) - n_client_per_domain_dict[d] * n_img_per_client_dict[d] for d in domains}
+    imgs_per_client_dict = {d : [n_img_per_client_dict[d] + 1 if i < rem_imgs_dict[d] else n_img_per_client_dict[d] for i in range(n_client_per_domain_dict[d])] for d in domains}
+
+    # Separate the data source to clients
+    data_sources = []
+    for d in domains:
+        imgs_per_client_list = np.cumsum(imgs_per_client_dict[d]).tolist()
+        imgs_per_client_list.insert(0, 0)
+        for j in range(n_client_per_domain_dict[d]):
+            data_sources.append(domain_dict[d][imgs_per_client_list[j] : imgs_per_client_list[j+1]])
+
+    # Build sampler
+    samplers = [build_sampler(
+        sampler_type,
+        cfg=cfg,
+        data_source=ds,
+        batch_size=batch_size,
+        n_domain=n_domain,
+        n_ins=n_ins
+    ) for ds in data_sources]
+
+    if dataset_wrapper is None:
+        dataset_wrapper = DatasetWrapper
+
+    # Build data loader
+    data_loader = [torch.utils.data.DataLoader(
+        dataset_wrapper(cfg, data_sources[i], transform=tfm, is_train=is_train),
+        batch_size=batch_size,
+        sampler=samplers[i],
+        num_workers=cfg.DATALOADER.NUM_WORKERS,
+        drop_last=is_train and len(data_sources[i]) >= batch_size,
+        pin_memory=(torch.cuda.is_available() and cfg.USE_CUDA),
+    ) for i in range(num_clients)]
+    assert len(data_loader) > 0
+
+    return data_loader
+
+
+# DDG-edited
 class DataManager:
 
     def __init__(
@@ -55,7 +129,8 @@ class DataManager:
         cfg,
         custom_tfm_train=None,
         custom_tfm_test=None,
-        dataset_wrapper=None
+        dataset_wrapper=None,
+        num_clients=30
     ):
         # Load dataset
         dataset = build_dataset(cfg)
@@ -86,6 +161,23 @@ class DataManager:
             dataset_wrapper=dataset_wrapper
         )
 
+        # Build train_loader_x_dfed for Decentralized (DDG-added)
+        train_loader_x_dfed = build_data_loaders_dfed(
+            cfg,
+            sampler_type=cfg.DATALOADER.TRAIN_X.SAMPLER,
+            data_source=dataset.train_x,
+            batch_size=cfg.DATALOADER.TRAIN_X.BATCH_SIZE,
+            n_domain=cfg.DATALOADER.TRAIN_X.N_DOMAIN,
+            n_ins=cfg.DATALOADER.TRAIN_X.N_INS,
+            tfm=tfm_train,
+            is_train=True,
+            dataset_wrapper=dataset_wrapper,
+            num_clients=num_clients
+        )
+
+        # Build train_loader_u_dfed for Decentralized (DDG-added)
+        train_loader_u_dfed = None
+
         # Build train_loader_u
         train_loader_u = None
         if dataset.train_u:
@@ -110,6 +202,20 @@ class DataManager:
                 tfm=tfm_train,
                 is_train=True,
                 dataset_wrapper=dataset_wrapper
+            )
+
+            # DDG-added
+            train_loader_u_dfed = build_data_loaders_dfed(
+                cfg,
+                sampler_type=sampler_type_,
+                data_source=dataset.train_u,
+                batch_size=batch_size_,
+                n_domain=n_domain_,
+                n_ins=n_ins_,
+                tfm=tfm_train,
+                is_train=True,
+                dataset_wrapper=dataset_wrapper,
+                num_clients=num_clients
             )
 
         # Build val_loader
@@ -147,6 +253,10 @@ class DataManager:
         self.train_loader_u = train_loader_u
         self.val_loader = val_loader
         self.test_loader = test_loader
+
+        # DDG-added
+        self.train_loader_x_dfed = train_loader_x_dfed
+        self.train_loader_u_dfed = train_loader_u_dfed
 
         if cfg.VERBOSE:
             self.show_dataset_summary(cfg)
